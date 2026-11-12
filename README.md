@@ -1,8 +1,8 @@
 # JobHunt (public, single-container build)
 
-A public listing of every job JobHunt finds on employers' own career boards (Greenhouse, Lever,
-Ashby, Workday, SmartRecruiters, … ~48k boards) plus a few public aggregators. Visitors browse and
-filter the whole list; there is no personal matching, scoring or applied/hidden tracking.
+A public listing of every **tech job** JobHunt finds on employers' own career boards (Greenhouse,
+Lever, Ashby, Workday, SmartRecruiters, … ~48k boards) plus a few public aggregators. Visitors
+browse and filter the whole list; there is no personal matching, scoring or applied/hidden tracking.
 
 ```
  one container ──────────────────────────────────────────────
@@ -30,15 +30,17 @@ push. The app itself doesn't depend on its hostname; the URL is used by the keep
 1. Push this directory to a GitHub/GitLab repository.
 2. Render → **New → Web Service** → pick the repo. Runtime **Docker** (Dockerfile at the root).
 3. **Health check path:** `/api/health`.
-4. **Persistent disk** (paid instance types): mount path `/app/data`, 10 GB or more. Without a disk
-   the database is rebuilt from scratch after every deploy or restart. It refills on its own,
-   but takes a while.
-5. Instance size: **1 GB or more** (2 GB is comfortable). Measured during the first crawl,
-   private memory was ~490 MB with the separate worker and ~410 MB with
-   `server.separate_worker: false`, plus ~75 MB of Postgres shared memory. A 512 MB instance
-   is therefore too tight. If you must use one, set `separate_worker: false` and lower
-   `fetch.max_concurrency`. With 2 GB or more, raise the values noted in the `server` section
-   for faster crawling.
+4. **Database**, pick one:
+   * **External Postgres (recommended on the free plan):** create a free database (e.g. Aiven,
+     1 GB), then add the environment variable `DATABASE_URL` on Render with the provider's
+     *direct* (non-pooled) connection URL, pasted as-is. Set `storage.max_db_mb` to the plan's
+     size. The data survives restarts and the container uses ~200 MB less memory.
+   * **Embedded** (default when `DATABASE_URL` is unset): on paid plans attach a persistent disk at
+     `/app/data`. Without one (free plan) the database starts empty after every restart.
+5. Instance size: the defaults fit Render free (512 MB). With the embedded database, the first
+   crawl ran at ~370–400 MB of process memory under a hard 512 MB limit, with no OOM kills.
+   With an external database it is ~200 MB. With 2 GB or more, raise the values noted in the
+   `server` section for faster crawling.
 6. Custom domain: Render → Settings → Custom Domains, then update `server.public_url`.
 
 On first start the image seeds the company registry (~30 s) and starts crawling. Jobs appear
@@ -64,6 +66,22 @@ app, has no dependencies (Python 3.9+ standard library), and reads the same conf
   `*/10 * * * * python3 /path/to/keepalive/keepalive.py --once`
 * Override the target without editing the config: `--url https://…/api/health` or `KEEPALIVE_URL`.
 
+## Staying within limits
+
+* **Storage:** only tech jobs are stored (`storage.tech_only`), and descriptions are capped at
+  8,000 characters. When the database passes `storage.high_water_pct` (80%) of
+  `storage.max_db_mb`, the worker sets a job cap and deletes the oldest jobs beyond it: closed
+  ones first, then duplicate copies, then by posting date. The freed space is reused, so the size
+  levels off; the cap is only lowered again if the database keeps growing. Older postings are not
+  re-added by later fetches. The site keeps working throughout. The Sources drawer shows the
+  database size and the current cap.
+* **Memory:** the supervisor watches the container's memory (limit auto-detected, or
+  `server.memory_limit_mb`). Above `server.memory_guard_pct` (85%) it restarts just the fetch
+  worker, which holds most of the memory and resumes from the database. A crashed worker is also
+  restarted on its own. The website keeps serving, instead of the platform killing the whole
+  container (502s, then an empty restart). `MALLOC_ARENA_MAX=2` and connection recycling keep the
+  baseline low.
+
 ## Performance
 
 * Fetching runs in a separate **worker** process (`server.separate_worker`, on by default), so
@@ -77,7 +95,7 @@ app, has no dependencies (Python 3.9+ standard library), and reads the same conf
 
 * One container: embedded PostgreSQL + FastAPI (which now also serves the dashboard; no nginx).
 * Matching rules are neutral (no title/skill/location/seniority filters, no pinned companies), so
-  every job found is stored and listed. The dashboard shows all open jobs by default; filters
-  (tech only, remote, skills, category, hide flagged agencies, …) are opt-in.
+  every tech job found is stored and listed. The dashboard shows all open jobs by default; filters
+  (remote, skills, category, hide flagged agencies, …) are opt-in.
 * Read-only API: applied/hidden tracking, notes, CSV export, and the manual refresh, verify and
   validate endpoints are removed. `/api/config` no longer publishes the config. API docs are off.

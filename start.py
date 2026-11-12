@@ -74,19 +74,92 @@ def run(cmd: list[str], **kw) -> None:
     subprocess.run(cmd, check=True, preexec_fn=demote(), **kw)
 
 
+def _read(path: str) -> str | None:
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def memory_limit_mb(configured: int) -> int:
+    """The container's memory limit: server.memory_limit_mb, else the cgroup limit, else 512."""
+    if configured:
+        return configured
+    raw = _read("/sys/fs/cgroup/memory.max") or _read("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if raw and raw.isdigit() and int(raw) < 2**50:
+        return int(raw) // 2**20
+    return 512
+
+
+def memory_used_mb() -> float | None:
+    """Memory the kernel can't reclaim (process memory + shared memory), i.e. what triggers
+    the OOM killer. Page cache is excluded: it is dropped automatically under pressure."""
+    stat = _read("/sys/fs/cgroup/memory.stat")
+    keys = ("anon", "shmem")
+    if stat is None:  # cgroup v1
+        stat, keys = _read("/sys/fs/cgroup/memory/memory.stat"), ("total_rss", "total_shmem")
+    if stat is None:
+        return None
+    vals = dict(line.split()[:2] for line in stat.splitlines() if " " in line)
+    return sum(int(vals.get(k, 0)) for k in keys) / 2**20
+
+
 class Stack:
     def __init__(self) -> None:
         self.procs: list[tuple[str, subprocess.Popen]] = []
         self.optional: set[str] = set()
+        self.restartable: dict[str, tuple[list[str], dict]] = {}
+        self.restarts: dict[str, float] = {}
         self.stopping = False
+        self.mem_limit = 512
+        self.mem_guard_pct = 85
+        self.last_mem_restart = 0.0
 
-    def spawn(self, name: str, cmd: list[str], env: dict, optional: bool = False) -> subprocess.Popen:
+    def spawn(self, name: str, cmd: list[str], env: dict, optional: bool = False,
+              restartable: bool = False) -> subprocess.Popen:
         log(f"starting {name}")
         if optional:
             self.optional.add(name)
+        if restartable:
+            self.restartable[name] = (cmd, env)
         p = subprocess.Popen(cmd, env=env, preexec_fn=demote())
         self.procs.append((name, p))
         return p
+
+    def restart(self, name: str, reason: str) -> None:
+        """Stop and start one process; the rest of the stack (and the site) keeps running."""
+        for entry in list(self.procs):
+            n, p = entry
+            if n != name:
+                continue
+            log(f"restarting {name}: {reason}")
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.wait()
+            self.procs.remove(entry)
+            cmd, env = self.restartable[name]
+            self.spawn(name, cmd, env)
+            self.restarts[name] = time.monotonic()
+
+    def guard_memory(self) -> None:
+        """Before the container reaches its memory limit (where the platform would kill and
+        restart everything), restart the process holding the most memory that is safe to
+        restart: the fetch worker. It picks up where it left off; the site stays up."""
+        used = memory_used_mb()
+        if used is None or used < self.mem_limit * self.mem_guard_pct / 100:
+            return
+        if time.monotonic() - self.last_mem_restart < 120:  # give the restart time to take effect
+            return
+        self.last_mem_restart = time.monotonic()
+        running = [n for n, p in self.procs if p.poll() is None]
+        for name in ("discovery", "worker", "web"):  # least to most user-visible
+            if name in running and name in self.restartable:
+                self.restart(name, f"memory {used:.0f} MB of {self.mem_limit} MB limit")
+                return
 
     def stop(self, *_):
         if self.stopping:
@@ -104,8 +177,13 @@ class Stack:
 
     def supervise(self) -> int:
         while not self.stopping:
+            self.guard_memory()
             for name, p in list(self.procs):
-                if p.poll() is not None and name in self.optional:
+                if p.poll() is not None and name in self.restartable and name != "web":
+                    # A crashed worker is restarted on its own (at most once a minute).
+                    if time.monotonic() - self.restarts.get(name, 0) > 60:
+                        self.restart(name, f"exited with code {p.returncode}")
+                elif p.poll() is not None and name in self.optional:
                     log(f"{name} exited with code {p.returncode}; the site keeps running without it")
                     self.procs.remove((name, p))
                 elif p.poll() is not None:
@@ -171,6 +249,9 @@ def main() -> int:
     port = str(os.getenv("PORT") or cfg.get("port") or 10000)
 
     stack = Stack()
+    stack.mem_limit = memory_limit_mb(int(cfg.get("memory_limit_mb") or 0))
+    stack.mem_guard_pct = int(cfg.get("memory_guard_pct") or 85)
+    log(f"memory limit {stack.mem_limit} MB; the fetch worker is restarted above {stack.mem_guard_pct}%")
     signal.signal(signal.SIGTERM, stack.stop)
     signal.signal(signal.SIGINT, stack.stop)
 
@@ -191,15 +272,15 @@ def main() -> int:
     stack.spawn("web", [
         sys.executable, "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", port,
         "--proxy-headers", "--forwarded-allow-ips", "*", "--no-access-log",
-    ], web_env)
+    ], web_env, restartable=worker_env is None)  # single-process mode: last-resort memory restart
     if worker_env is not None:
-        stack.spawn("worker", [sys.executable, "-m", "app.worker"], worker_env)
+        stack.spawn("worker", [sys.executable, "-m", "app.worker"], worker_env, restartable=True)
     if cfg.get("discovery_enabled"):
         stack.spawn("discovery", [
             sys.executable, "-m", "app.discover", "--daemon",
             "--every-hours", str(cfg.get("discovery_every_hours", 24)),
             "--out", str(data_dir / "companies.discovered.csv"),
-        ], env, optional=True)
+        ], env, optional=True, restartable=True)
     log(f"listening on port {port}")
     return stack.supervise()
 

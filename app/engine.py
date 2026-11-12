@@ -23,7 +23,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from . import registry
 from .config import AppConfig, config_store
-from .db import Company, FetchRun, Job, Session, engine as db_engine
+from .db import AppState, Company, FetchRun, Job, Session, engine as db_engine
 from .http import FetchError, Http
 from .matching import InvalidJob, Matcher, NormalizedJob, enrich, normalize
 from .sources import ATS_SOURCES, SOURCES, BoardResult, FetchContext, VerifyResult
@@ -95,6 +95,11 @@ class Engine:
         self.last_maintenance_at: datetime | None = None
         self.last_error: str | None = None
         self.resolver_stats: dict[str, Any] = {}
+        # Storage budget (see enforce_storage); persisted in app_state.
+        self.job_cap: int | None = None          # max jobs kept once the database got full
+        self.cap_size_mb: float | None = None    # database size when the cap was last lowered
+        self.evict_before: datetime | None = None  # postings older than this are not (re)stored
+        self.last_eviction: dict[str, Any] = {}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -115,6 +120,7 @@ class Engine:
             asyncio.create_task(self._board_loop(), name="board-loop"),
             asyncio.create_task(self._aggregator_loop(), name="aggregator-loop"),
             asyncio.create_task(self._maintenance_loop(), name="maintenance-loop"),
+            asyncio.create_task(self._storage_loop(), name="storage-loop"),
             asyncio.create_task(self._validate_loop(), name="validate-loop"),
             asyncio.create_task(self._config_loop(), name="config-loop"),
             asyncio.create_task(self._resolver_loop(), name="resolver-loop"),
@@ -260,6 +266,8 @@ class Engine:
                 status_code = int(m.group(1)) if m else None
             await self._ingest_safe(result, matcher, cfg, started)
             counts = await self._board_counts(result.board) if result.ok else {}
+            if result.ok and cfg.storage.tech_only:  # non-tech jobs aren't stored: count the listing
+                counts["jobs"] = max(counts.get("jobs", 0), len(result.jobs))
             upd = registry.next_fetch(c, cfg, ok=result.ok, status_code=status_code,
                                       jobs=counts.get("jobs", 0), tech=counts.get("tech", 0), matched=counts.get("matched", 0),
                                       error=result.error)
@@ -483,7 +491,13 @@ class Engine:
         changed = [n for u, n in by_uid.items() if existing.get(u) != n.content_hash]
         # CPU-heavy parts (skills for tech jobs) run off the event loop.
         changed = await asyncio.to_thread(lambda: [enrich(n, matcher) for n in changed])
-        keep = [n for n in changed if n.matched or n.is_tech or n.uid in existing or cfg.match.store_non_matching]
+        if cfg.storage.tech_only:
+            keep = [n for n in changed if n.is_tech]
+        else:
+            keep = [n for n in changed if n.matched or n.is_tech or n.uid in existing or cfg.match.store_non_matching]
+        if self.evict_before is not None:  # don't re-add postings the size budget already evicted
+            cutoff = self.evict_before
+            keep = [n for n in keep if n.uid in existing or (n.posted_at or now) >= cutoff]
         stats["matched"] = sum(1 for n in changed if n.matched)
 
         async with self._write_lock, Session() as s:
@@ -593,7 +607,112 @@ class Engine:
         async with self._write_lock, Session() as s:
             await s.execute(delete(Job).where(Job.status == "closed", Job.closed_at < cutoff, Job.user_state == "new"))
             await s.execute(delete(FetchRun).where(FetchRun.started_at < utcnow() - timedelta(days=7)))
+            if self.cfg.storage.tech_only:  # e.g. stored before tech_only was enabled
+                await s.execute(delete(Job).where(Job.is_tech.is_(False), Job.user_state == "new"))
             await s.commit()
+
+    # ------------------------------------------------------------ storage budget
+
+    async def _storage_loop(self) -> None:
+        await self._load_storage_state()
+        while True:
+            try:
+                await self.enforce_storage()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # e.g. the database refuses writes when full: retry next round
+                log.exception("storage check failed")
+                self.last_error = f"storage check failed: {e}"
+            await asyncio.sleep(60)
+
+    async def _load_storage_state(self) -> None:
+        async with Session() as s:
+            st = dict((await s.execute(select(AppState.key, AppState.value))).tuples().all())
+        self.job_cap = int(st["job_cap"]) if st.get("job_cap") else None
+        self.cap_size_mb = float(st["cap_size_mb"]) if st.get("cap_size_mb") else None
+        self.evict_before = datetime.fromisoformat(st["evict_before"]) if st.get("evict_before") else None
+
+    async def _save_storage_state(self) -> None:
+        values = {"job_cap": str(self.job_cap or ""), "cap_size_mb": str(self.cap_size_mb or ""),
+                  "evict_before": self.evict_before.isoformat() if self.evict_before else ""}
+        async with Session() as s:
+            stmt = insert(AppState).values([{"key": k, "value": v} for k, v in values.items()])
+            await s.execute(stmt.on_conflict_do_update(index_elements=[AppState.key], set_={"value": stmt.excluded.value}))
+            await s.commit()
+
+    async def enforce_storage(self) -> None:
+        """Keep the database under storage.max_db_mb by dropping the oldest jobs.
+
+        Postgres doesn't give deleted space back to the disk; it reuses it for new rows.
+        So the size can't tell us when enough was deleted. Instead, crossing the high-water
+        mark sets a job cap (jobs now minus evict_pct). The oldest jobs beyond the cap are
+        deleted and their space is reused by new ones, so the size levels off. The cap is
+        only lowered again if the database keeps growing anyway."""
+        st = self.cfg.storage
+        if not st.max_db_mb:
+            if self.job_cap or self.evict_before:
+                self.job_cap = self.cap_size_mb = self.evict_before = None
+                await self._save_storage_state()
+            return
+        async with Session() as s:
+            size_mb = (await s.execute(text("SELECT pg_database_size(current_database())"))).scalar_one() / 2**20
+            n = (await s.execute(select(func.count()).select_from(Job))).scalar_one()
+        high = st.max_db_mb * st.high_water_pct / 100
+        changed = False
+        if size_mb > high and (self.cap_size_mb is None or size_mb > self.cap_size_mb + st.max_db_mb * 0.05):
+            self.job_cap = max(100, int(min(n, self.job_cap or n) * (1 - st.evict_pct / 100)))
+            self.cap_size_mb = size_mb
+            changed = True
+            log.warning("database at %.0f MB of %d MB budget: keeping the newest %d jobs", size_mb, st.max_db_mb, self.job_cap)
+        elif self.job_cap and size_mb < high * 0.6:  # budget raised or space freed: lift the cap
+            self.job_cap = self.cap_size_mb = self.evict_before = None
+            changed = True
+            log.info("database at %.0f MB: storage cap lifted", size_mb)
+        if self.evict_before and self.job_cap and n < self.job_cap * 0.8:  # room again for older postings
+            self.evict_before = None
+            changed = True
+        if self.job_cap and n > self.job_cap:
+            await self._evict(n - self.job_cap)
+            changed = True
+        if changed:
+            await self._save_storage_state()
+
+    async def _evict(self, count: int) -> None:
+        """Delete `count` jobs: closed first, then duplicate copies, then the oldest postings."""
+        deleted, newest = 0, None
+        async with self._write_lock:
+            while deleted < count:
+                async with Session() as s:
+                    row = (await s.execute(text("""
+                        WITH victims AS (
+                            SELECT id FROM jobs WHERE user_state = 'new'
+                             ORDER BY (status = 'active'), (duplicate_of IS NULL),
+                                      coalesce(posted_at, first_seen_at), id
+                             LIMIT :k)
+                        , gone AS (DELETE FROM jobs j USING victims v WHERE j.id = v.id
+                                   RETURNING j.status, j.duplicate_of, coalesce(j.posted_at, j.first_seen_at) AS ts)
+                        -- the age cutoff comes only from listings evicted for being oldest,
+                        -- not from closed postings or duplicate copies (those go first at any age)
+                        SELECT count(*), max(ts) FILTER (WHERE status = 'active' AND duplicate_of IS NULL)
+                          FROM gone
+                    """), {"k": min(5000, count - deleted)})).one()
+                    # copies whose primary was deleted become stand-alone listings again
+                    await s.execute(text("""
+                        UPDATE jobs SET duplicate_of = NULL WHERE duplicate_of IS NOT NULL
+                           AND NOT EXISTS (SELECT 1 FROM jobs p WHERE p.id = jobs.duplicate_of)"""))
+                    await s.commit()
+                if not row[0]:
+                    break
+                deleted += row[0]
+                if row[1] is not None:
+                    newest = max(newest, row[1]) if newest else row[1]
+        if newest is not None:
+            self.evict_before = max(self.evict_before, newest) if self.evict_before else newest
+        async with db_engine.connect() as conn:  # make the freed space reusable right away
+            conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+            await conn.exec_driver_sql("VACUUM jobs")
+        self.last_eviction = {"at": utcnow(), "deleted": deleted, "older_than": self.evict_before}
+        log.info("storage budget: evicted %d oldest jobs (keeping postings newer than %s)", deleted, self.evict_before)
 
     # ------------------------------------------------------------ re-scoring
 
@@ -814,6 +933,14 @@ class Engine:
             "resolver": await self._resolver_summary(),
             "failing_boards": [dict(r) for r in failing],
             "boards": [dict(r) for r in runs],
+        }
+        async with Session() as s:
+            st = dict((await s.execute(select(AppState.key, AppState.value))).tuples().all())
+            size = (await s.execute(text("SELECT pg_database_size(current_database())"))).scalar_one()
+        out["storage"] = {
+            "db_mb": round(size / 2**20), "budget_mb": self.cfg.storage.max_db_mb or None,
+            "tech_only": self.cfg.storage.tech_only, "job_cap": int(st["job_cap"]) if st.get("job_cap") else None,
+            "evict_before": st.get("evict_before") or None,
         }
         if live:
             out.update({k: live.get(k) for k in STATUS_FIELDS if k != "resolver_stats"})

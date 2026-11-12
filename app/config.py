@@ -170,6 +170,8 @@ class ServerCfg(Strict):
     postgres_max_connections: int = Field(40, ge=20, le=500)
     db_pool_size: int = Field(5, ge=2, le=100)     # worker connections (each costs memory in Postgres)
     separate_worker: bool = True         # fetch in its own process (responsive UI; ~+80 MB memory)
+    memory_limit_mb: int = Field(0, ge=0)  # 0 = detect from the container (Render free: 512)
+    memory_guard_pct: int = Field(85, ge=50, le=95)  # restart the fetch worker above this % of the limit
     discovery_enabled: bool = False      # grow the company registry daily (CPU/network heavy)
     discovery_every_hours: float = Field(24, ge=1, le=720)
 
@@ -181,8 +183,17 @@ class KeepaliveCfg(Strict):
     timeout_seconds: float = Field(60, gt=0, le=300)   # a cold start can take ~1 minute
 
 
+class StorageCfg(Strict):
+    """Keeps the database inside a size budget (free hosted Postgres tiers are ~0.5-1 GB)."""
+    tech_only: bool = True               # store only tech jobs (non-tech postings are never written)
+    max_db_mb: int = Field(0, ge=0)      # database size budget in MB; 0 = unlimited
+    high_water_pct: int = Field(80, ge=30, le=95)  # start evicting at this % of max_db_mb
+    evict_pct: int = Field(15, ge=1, le=50)        # each eviction step drops this % of jobs (oldest first)
+
+
 class AppConfig(Strict):
     server: ServerCfg = ServerCfg()
+    storage: StorageCfg = StorageCfg()
     keepalive: KeepaliveCfg = KeepaliveCfg()
     fetch: FetchCfg = FetchCfg()
     validation: ValidationCfg = ValidationCfg()

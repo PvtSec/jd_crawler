@@ -5,7 +5,8 @@
 FROM python:3.12.8-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PG_BIN=/usr/lib/postgresql/15/bin JOBHUNT_CONFIG=/app/config/config.yaml
+    PG_BIN=/usr/lib/postgresql/15/bin JOBHUNT_CONFIG=/app/config/config.yaml \
+    MALLOC_ARENA_MAX=2
 
 # PostgreSQL 15 server (includes pg_trgm). The cluster is created at first start, not here.
 RUN apt-get update \

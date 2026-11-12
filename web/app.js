@@ -311,7 +311,6 @@ function syncControls() {
   $("#f-status").value = S.status;
   $("#f-salary").checked = S.has_salary;
   $("#f-dups").checked = S.include_duplicates;
-  $("#f-techonly").checked = S.tech_only;
   $("#f-flagged").checked = !S.include_flagged;
   $("#f-lang").checked = !S.include_lang_restricted;
   $("#f-indirect").checked = !S.include_indirect;
@@ -333,7 +332,6 @@ function bindControls() {
   $("#f-status").addEventListener("change", (e) => setState({ status: e.target.value }));
   $("#f-salary").addEventListener("change", (e) => setState({ has_salary: e.target.checked }));
   $("#f-dups").addEventListener("change", (e) => setState({ include_duplicates: e.target.checked }));
-  $("#f-techonly").addEventListener("change", (e) => setState({ tech_only: e.target.checked }));
   $("#f-flagged").addEventListener("change", (e) => setState({ include_flagged: !e.target.checked }));
   $("#f-lang").addEventListener("change", (e) => setState({ include_lang_restricted: !e.target.checked }));
   $("#f-indirect").addEventListener("change", (e) => setState({ include_indirect: !e.target.checked }));
@@ -383,7 +381,7 @@ async function loadStats() {
     $("#stats").replaceChildren(
       h("span", { class: "stat", title: "Open postings (duplicates collapsed)" }, h("b", { text: n(s.open_jobs) }), " open jobs at ", h("b", { text: n(s.open_companies) }), " companies"),
       h("span", { class: "stat" }, h("b", { text: n(s.new_24h) }), " new in 24h"),
-      h("span", { class: "stat alt" }, h("b", { text: n(s.open_tech_jobs) }), " tech · ", h("b", { text: n(s.open_remote_jobs) }), " remote"),
+      h("span", { class: "stat alt" }, h("b", { text: n(s.open_remote_jobs) }), " remote"),
       h("span", { class: "stat alt", title: `${n(s.companies_hiring)} currently hiring · ${n(s.companies_tech)} with tech roles · ${n(s.companies_pending)} not fetched yet` },
         h("b", { text: n(s.companies) }), " companies tracked"),
     );
@@ -450,6 +448,8 @@ function renderDrawer(st) {
       kv("Aggregators", st.next_fetch_at ? `next cycle ${ago(st.next_fetch_at)}` : "—"),
       kv("Last liveness check", st.last_validation_at ? ago(st.last_validation_at) : "—"),
       kv("Last dedup / cleanup", st.last_maintenance_at ? ago(st.last_maintenance_at) : "—"),
+      st.storage ? kv("Database", `${num(st.storage.db_mb)} MB${st.storage.budget_mb ? ` of ${num(st.storage.budget_mb)} MB budget` : ""}`
+        + (st.storage.job_cap ? ` · keeping the newest ${num(st.storage.job_cap)} jobs` : "")) : null,
       kv("Config version", String(st.config_version)),
       st.last_error ? kv("Last error", st.last_error) : null,
     ),

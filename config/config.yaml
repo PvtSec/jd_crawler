@@ -14,14 +14,18 @@ server:
   # mounted at this path, or the data is rebuilt from scratch on every deploy.
   data_dir: /app/data
   # Empty = run PostgreSQL inside the container (stored in <data_dir>/pgdata).
-  # To use an external Postgres instead, set the DATABASE_URL environment
-  # variable (keeps the password out of git), in the form
-  # postgresql+asyncpg://user:password@host:5432/dbname
+  # To use an external Postgres instead (Aiven, Supabase, Neon, ...), set the
+  # DATABASE_URL environment variable on Render (keeps the password out of git).
+  # Paste the provider's URL as-is, e.g. postgres://user:pw@host:port/db?sslmode=require
+  # Use the DIRECT connection, not a pooler (pgbouncer) endpoint.
   database_url: ""
   log_level: INFO
-  # Memory: ~512 MB instances need the small values below; with 2 GB+ you can
-  # use e.g. shared_buffers 256MB, work_mem 16MB, db_pool_size 10, fetch.max_concurrency 32.
-  postgres_shared_buffers: 64MB   # embedded Postgres only
+  # Memory: the values below are sized for a 512 MB instance (Render free). With
+  # 2 GB+ you can use e.g. shared_buffers 256MB, work_mem 16MB, db_pool_size 10,
+  # fetch.max_concurrency 32.
+  memory_limit_mb: 0              # 0 = detect from the container
+  memory_guard_pct: 85            # above this, the fetch worker is restarted (the site stays up)
+  postgres_shared_buffers: 32MB   # embedded Postgres only
   postgres_work_mem: 4MB          # embedded Postgres only
   postgres_max_connections: 40
   db_pool_size: 5                 # fetch worker -> database connections
@@ -34,6 +38,15 @@ server:
 
 # Read by keepalive/keepalive.py, which runs OUTSIDE the app (cron, GitHub
 # Actions, another machine) and pings it so Render never puts it to sleep.
+# Keeps the database inside a size budget so it never fills up: once it passes
+# high_water_pct of max_db_mb, the oldest jobs are deleted to make room for new
+# ones (closed and duplicate listings go first). The site stays up throughout.
+storage:
+  tech_only: true                 # store only tech jobs (non-tech postings are skipped)
+  max_db_mb: 1000                 # your database's size limit in MB (free tiers: ~500-1000); 0 = unlimited
+  high_water_pct: 80              # start evicting at this % of max_db_mb
+  evict_pct: 15                   # each eviction step drops this % of the stored jobs
+
 keepalive:
   url: ""                         # empty = <server.public_url>/api/health
   interval_minutes: 10            # Render free instances sleep after 15 idle minutes
@@ -41,18 +54,18 @@ keepalive:
 
 fetch:
   interval_minutes: 60            # boards with tech jobs + aggregators are polled this often (5..1440)
-  max_concurrency: 16             # total parallel HTTP requests
+  max_concurrency: 8              # total parallel HTTP requests (more = faster crawl, more memory)
   per_host_concurrency: 4         # parallel requests per host (be polite)
   timeout_seconds: 25
   retries: 2                      # retries on 429/5xx/timeouts, with backoff
   user_agent: "JobHunt/1.0 (job listing aggregator)"
-  max_description_chars: 20000
+  max_description_chars: 8000     # longer descriptions are cut (saves space; "Open" shows the full posting)
   warm_interval_hours: 4
-  cool_interval_hours: 12         # boards with only non-tech jobs
+  cool_interval_hours: 12         # boards with only non-tech openings
   cold_interval_hours: 48         # boards with no open jobs
   max_backoff_hours: 168          # failing boards back off exponentially up to this
   gone_after_failures: 4          # consecutive 404s => board retired (rechecked monthly)
-  non_tech_description_chars: 400 # non-tech jobs keep a short description (saves disk)
+  non_tech_description_chars: 400 # only used if storage.tech_only is false
 
 validation:
   interval_minutes: 60            # liveness check cycle for aggregator jobs
@@ -79,7 +92,7 @@ match:
   max_years_experience: null
   max_age_days: null
   min_score: 0
-  store_non_matching: true
+  store_non_matching: false       # with storage.tech_only, only tech jobs are kept anyway
   allowed_languages: [english]
   skip_language_requirements: true   # only labels such jobs; they are still listed
 

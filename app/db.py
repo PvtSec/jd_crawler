@@ -11,10 +11,28 @@ from sqlalchemy.dialects.postgresql import ARRAY, TSVECTOR
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://jobhunt:jobhunt@db:5432/jobhunt")
+def _asyncpg_url(url: str) -> str:
+    """Accept the URLs hosting providers hand out (postgres://...?sslmode=require) as-is."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    scheme = "postgresql+asyncpg" if parts.scheme in ("postgres", "postgresql") else parts.scheme
+    query = []
+    for k, v in parse_qsl(parts.query, keep_blank_values=True):
+        if k == "sslmode":
+            query.append(("ssl", v))
+        elif k not in ("channel_binding", "options", "target_session_attrs"):  # libpq-only
+            query.append((k, v))
+    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+DATABASE_URL = _asyncpg_url(os.getenv("DATABASE_URL", "postgresql+asyncpg://jobhunt:jobhunt@db:5432/jobhunt"))
 
 POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))  # each connection is a Postgres backend (memory)
-engine = create_async_engine(DATABASE_URL, pool_size=POOL_SIZE, max_overflow=max(2, POOL_SIZE // 2), pool_pre_ping=True)
+# Connections are recycled every 10 minutes: a Postgres backend keeps the memory of the largest
+# query it ran until it exits, which adds up on small instances.
+engine = create_async_engine(DATABASE_URL, pool_size=POOL_SIZE, max_overflow=max(2, POOL_SIZE // 2),
+                             pool_pre_ping=True, pool_recycle=600)
 Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
@@ -151,6 +169,14 @@ class CompanyResolution(Base):
     attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     found: Mapped[str] = mapped_column(String(250), default="")  # "ats:token" or ""
     detail: Mapped[str] = mapped_column(Text, default="")
+
+
+class AppState(Base):
+    """Small key/value store (e.g. the storage cap), shared by the API and worker processes."""
+    __tablename__ = "app_state"
+
+    key: Mapped[str] = mapped_column(String(60), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="")
 
 
 class FetchRun(Base):
