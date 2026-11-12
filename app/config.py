@@ -168,7 +168,8 @@ class ServerCfg(Strict):
     postgres_shared_buffers: str = "64MB"
     postgres_work_mem: str = "4MB"
     postgres_max_connections: int = Field(40, ge=20, le=500)
-    db_pool_size: int = Field(5, ge=2, le=100)     # app connections (each costs memory in Postgres)
+    db_pool_size: int = Field(5, ge=2, le=100)     # worker connections (each costs memory in Postgres)
+    separate_worker: bool = True         # fetch in its own process (responsive UI; ~+80 MB memory)
     discovery_enabled: bool = False      # grow the company registry daily (CPU/network heavy)
     discovery_every_hours: float = Field(24, ge=1, le=720)
 

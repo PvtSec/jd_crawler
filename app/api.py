@@ -6,6 +6,8 @@ exposed; the background engine keeps the data fresh on its own.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -189,15 +191,57 @@ async def get_job(job_id: int) -> dict[str, Any]:
     return {**_row(row), "duplicates": [_row(d) for d in dups]}
 
 
-_facet_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+class _StaleCache:
+    """Stale-while-revalidate: answer from the last result at once and recompute in the
+    background once it is older than `ttl`. Only the very first request waits."""
+
+    def __init__(self, ttl: float) -> None:
+        self.ttl = ttl
+        self.values: dict[str, tuple[float, Any]] = {}
+        self.tasks: dict[str, asyncio.Task] = {}
+
+    async def get(self, key: str, compute) -> Any:
+        hit = self.values.get(key)
+        if hit is None:
+            return await self._run(key, compute)
+        if time.monotonic() - hit[0] > self.ttl and key not in self.tasks:
+            task = asyncio.create_task(self._refresh(key, compute))
+            self.tasks[key] = task
+            task.add_done_callback(lambda _t, k=key: self.tasks.pop(k, None))
+        return hit[1]
+
+    async def _run(self, key: str, compute) -> Any:
+        value = await compute()
+        self.values[key] = (time.monotonic(), value)
+        return value
+
+    async def _refresh(self, key: str, compute) -> None:
+        try:
+            await self._run(key, compute)
+        except Exception:
+            logging.getLogger(__name__).exception("background refresh of %s failed", key)
+
+
+_facets = _StaleCache(ttl=60)
+_totals = _StaleCache(ttl=60)
+
+
+async def warm_caches() -> None:
+    """Fill the totals / facet caches at startup so the first page load is fast too."""
+    try:
+        await _totals.get("totals", _compute_totals)
+        await _facets.get("all", lambda: _compute_facets("all"))
+    except Exception:
+        logging.getLogger(__name__).exception("warming caches failed")
 
 
 @router.get("/facets")
 async def facets(view: View = "all") -> dict[str, Any]:
-    """Counts for filter widgets (cached briefly; cheap enough to recompute)."""
-    hit = _facet_cache.get(view)
-    if hit and time.monotonic() - hit[0] < 20:
-        return hit[1]
+    """Counts for filter widgets (at most ~1 minute old)."""
+    return await _facets.get(view, lambda: _compute_facets(view))
+
+
+async def _compute_facets(view: str) -> dict[str, Any]:
     base = Filters(view=view, status="active" if view in ("matches", "all") else "any")
     async with Session() as s:
         skills_sub = _apply(select(func.unnest(Job.skills).label("skill")), base).subquery()
@@ -219,18 +263,16 @@ async def facets(view: View = "all") -> dict[str, Any]:
             "companies": (await counts(Job.company))[:400],
             "seniority_levels": SENIORITY_LEVELS + ["unspecified"],
         }
-    _facet_cache[view] = (time.monotonic(), out)
     return out
-
-
-_stats_cache: tuple[float, dict[str, Any]] | None = None
 
 
 @router.get("/stats")
 async def stats() -> dict[str, Any]:
-    global _stats_cache
-    if _stats_cache and time.monotonic() - _stats_cache[0] < 10:
-        return _stats_cache[1]
+    """Table-wide totals (at most ~1 minute old; recomputed in the background)."""
+    return await _totals.get("totals", _compute_totals)
+
+
+async def _compute_totals() -> dict[str, Any]:
     async with Session() as s:
         row = (await s.execute(text("""
             SELECT
@@ -251,9 +293,7 @@ async def stats() -> dict[str, Any]:
                    count(*) FILTER (WHERE status = 'new') AS companies_pending
               FROM companies WHERE enabled
         """))).mappings().one()
-    out = {**dict(row), **dict(reg)}
-    _stats_cache = (time.monotonic(), out)
-    return out
+    return {**dict(row), **dict(reg)}
 
 
 @router.get("/companies")

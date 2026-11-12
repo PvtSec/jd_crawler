@@ -9,7 +9,7 @@ filter the whole list; there is no personal matching, scoring or applied/hidden 
  │ start.py (supervisor)                                      │
  │   ├─ PostgreSQL 15   unix socket only, <data_dir>/pgdata   │
  │   ├─ uvicorn :$PORT  API (/api, read-only) + dashboard (/) │
- │   │                  + background fetch/dedup/liveness     │
+ │   ├─ worker          fetch / dedup / liveness (app.worker) │
  │   └─ discovery       optional, grows the company registry  │
  ─────────────────────────────────────────────────────────────
  keepalive/keepalive.py   runs elsewhere, pings /api/health
@@ -33,8 +33,12 @@ push. The app itself doesn't depend on its hostname; the URL is used by the keep
 4. **Persistent disk** (paid instance types): mount path `/app/data`, 10 GB or more. Without a disk
    the database is rebuilt from scratch after every deploy or restart. It refills on its own,
    but takes a while.
-5. Instance size: 512 MB works with the defaults in `config.yaml`. With 2 GB or more, raise
-   the values noted in the `server` section for faster crawling.
+5. Instance size: **1 GB or more** (2 GB is comfortable). Measured during the first crawl,
+   private memory was ~490 MB with the separate worker and ~410 MB with
+   `server.separate_worker: false`, plus ~75 MB of Postgres shared memory. A 512 MB instance
+   is therefore too tight. If you must use one, set `separate_worker: false` and lower
+   `fetch.max_concurrency`. With 2 GB or more, raise the values noted in the `server` section
+   for faster crawling.
 6. Custom domain: Render → Settings → Custom Domains, then update `server.public_url`.
 
 On first start the image seeds the company registry (~30 s) and starts crawling. Jobs appear
@@ -59,6 +63,15 @@ app, has no dependencies (Python 3.9+ standard library), and reads the same conf
 * **Any always-on machine:** `python3 keepalive/keepalive.py` (loops forever), or from cron:
   `*/10 * * * * python3 /path/to/keepalive/keepalive.py --once`
 * Override the target without editing the config: `--url https://…/api/health` or `KEEPALIVE_URL`.
+
+## Performance
+
+* Fetching runs in a separate **worker** process (`server.separate_worker`, on by default), so
+  parsing thousands of boards never slows page loads. The worker shares its live progress with
+  the API through `<data_dir>/engine_status.json`, and the API process starts serving within
+  seconds instead of waiting for the registry to be seeded.
+* Header totals and filter counts are served from a cache that is refreshed in the background
+  (at most ~1 minute old) and warmed at startup, so these requests take a few milliseconds.
 
 ## What changed versus the personal version
 

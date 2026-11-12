@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import delete, func, or_, select, text, update
@@ -30,6 +33,15 @@ from .tracker import tracker
 log = logging.getLogger(__name__)
 
 ADVISORY_LOCK_ID = 7_301_984_221
+# "api": serve the API only (fetching runs in the worker container); "worker": run the
+# scheduler only; "all": both in one process (the original single-container layout).
+ROLE = os.getenv("JOBHUNT_ROLE", "all")
+DATA_DIR = Path(os.getenv("JOBHUNT_TRACKER", "/app/data/tracker.json")).parent
+STATUS_FILE = DATA_DIR / "engine_status.json"     # worker -> API: live scheduler state
+REFRESH_FILE = DATA_DIR / "refresh.request"        # API -> worker: "fetch now" button
+STATUS_FIELDS = ("fetching", "validating", "boards_in_flight", "boards_done", "last_fetch_started",
+                 "last_fetch_finished", "next_fetch_at", "last_validation_at", "last_maintenance_at",
+                 "last_error", "resolver_stats")
 UPSERT_CHUNK = 300
 
 CONTENT_COLS = (
@@ -87,6 +99,9 @@ class Engine:
     # ------------------------------------------------------------ lifecycle
 
     async def start(self) -> None:
+        if ROLE == "api":
+            self._tasks = [asyncio.create_task(self._api_config_loop(), name="config-loop")]
+            return
         await self.reconcile_tracker()
         self.is_leader = await self._acquire_leadership()
         if not self.is_leader:
@@ -104,6 +119,54 @@ class Engine:
             asyncio.create_task(self._config_loop(), name="config-loop"),
             asyncio.create_task(self._resolver_loop(), name="resolver-loop"),
         ]
+        if ROLE == "worker":
+            self._tasks.append(asyncio.create_task(self._publish_loop(), name="publish-loop"))
+
+    # ------------------------------------------------------------ worker <-> API (split mode)
+
+    async def _publish_loop(self) -> None:
+        """Worker: share live state with the API process and act on its refresh requests."""
+        while True:
+            try:
+                if REFRESH_FILE.exists():
+                    REFRESH_FILE.unlink(missing_ok=True)
+                    n = await self.trigger_fetch("hot")
+                    log.info("refresh requested from the UI: %d boards queued", n)
+                snap = {k: getattr(self, k) for k in STATUS_FIELDS}
+                snap["fetching"] = self.fetching or self._agg_lock.locked()
+                snap["heartbeat"] = utcnow()
+                tmp = STATUS_FILE.with_suffix(".tmp")
+                tmp.write_text(json.dumps(snap, default=str))
+                tmp.replace(STATUS_FILE)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("publishing worker status failed")
+            await asyncio.sleep(3)
+
+    async def _api_config_loop(self) -> None:
+        """API process: follow config.yaml edits (the worker re-scores; we only re-read)."""
+        while True:
+            await asyncio.sleep(5)
+            try:
+                if await asyncio.to_thread(config_store.reload):
+                    self.cfg = config_store.current
+                    self.matcher = Matcher(self.cfg)
+            except Exception:
+                log.exception("reloading config failed")
+
+    @staticmethod
+    def worker_state() -> dict[str, Any] | None:
+        """API process: the worker's last published state, or None if it isn't running."""
+        try:
+            snap = json.loads(STATUS_FILE.read_text())
+            beat = datetime.fromisoformat(snap["heartbeat"])
+        except (OSError, ValueError, KeyError):
+            return None
+        return snap if utcnow() - beat < timedelta(seconds=30) else None
+
+    def request_refresh(self) -> None:
+        REFRESH_FILE.touch()
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -430,6 +493,7 @@ class Engine:
 
     async def _write_board(self, s, result: BoardResult, cfg: AppConfig, keep: list[NormalizedJob],
                            touch: list[str], stats: dict[str, int], now: datetime) -> None:
+        tracker.reload_if_changed()
         state_by_uid = {uid: st for st in ("applied", "hidden") for uid in tracker.data[st]}
         for i in range(0, len(keep), UPSERT_CHUNK):
             rows = []
@@ -660,6 +724,7 @@ class Engine:
 
     async def reconcile_tracker(self) -> None:
         """Make the database reflect the tracker file (the source of truth)."""
+        tracker.reload_if_changed()
         async with Session() as s:
             tracked_uids: set[str] = set()
             for state in ("applied", "hidden"):
@@ -727,8 +792,12 @@ class Engine:
                 select(Company.ats, Company.token, Company.name, Company.last_error, Company.fail_count)
                 .where(Company.status == "error").order_by(Company.pinned.desc(), Company.fail_count.desc()).limit(25)
             )).mappings().all()
-        return {
-            "leader": self.is_leader,
+        live: dict[str, Any] = {}
+        if ROLE == "api":
+            live = self.worker_state() or {}
+        tracker.reload_if_changed()
+        out = {
+            "leader": self.is_leader or bool(live),
             "fetching": self.fetching or self._agg_lock.locked(),
             "validating": self.validating,
             "boards_in_flight": self.boards_in_flight,
@@ -746,6 +815,11 @@ class Engine:
             "failing_boards": [dict(r) for r in failing],
             "boards": [dict(r) for r in runs],
         }
+        if live:
+            out.update({k: live.get(k) for k in STATUS_FIELDS if k != "resolver_stats"})
+            out["resolver"]["last"] = live.get("resolver_stats") or {}
+            out["validating"] = out["validating"] or self.validating
+        return out
 
 
 engine = Engine()

@@ -32,10 +32,23 @@ class Tracker:
     def __init__(self, path: Path = TRACKER_PATH):
         self.path = path
         self._lock = asyncio.Lock()
+        self._loaded_mtime = 0.0
         self.data: dict[str, dict[str, dict[str, Any]]] = {"applied": {}, "hidden": {}}
         self._load()
 
+    def _mtime(self) -> float:
+        try:
+            return self.path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def reload_if_changed(self) -> None:
+        """Pick up writes made by another process (the API writes, the worker reads)."""
+        if self._mtime() != self._loaded_mtime:
+            self._load()
+
     def _load(self) -> None:
+        self._loaded_mtime = self._mtime()
         if not self.path.exists():
             return
         try:
@@ -67,6 +80,7 @@ class Tracker:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.path)
+            self._loaded_mtime = self._mtime()
         except BaseException:
             try:
                 os.unlink(tmp)

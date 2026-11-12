@@ -11,7 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .api import router
+from .api import router, warm_caches
 from .db import init_db
 from .engine import engine
 
@@ -42,10 +42,12 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(2)
     else:
         raise RuntimeError("database unavailable")
-    await engine.start()
+    await engine.start()  # JOBHUNT_ROLE=api: config reload only; fetching runs in app.worker
+    warm = asyncio.create_task(warm_caches())
     try:
         yield
     finally:
+        warm.cancel()
         await engine.stop()
 
 

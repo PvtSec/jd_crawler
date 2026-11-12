@@ -4,7 +4,7 @@
   1. reads the `server` section of config/config.yaml (env vars PORT / DATABASE_URL override)
   2. seeds the company lists into the data dir (first start only)
   3. starts an embedded PostgreSQL unless an external database is configured
-  4. starts the web app (API + dashboard) and, optionally, the discovery daemon
+  4. starts the web app (API + dashboard), the fetch worker and, optionally, the discovery daemon
   5. supervises them: if one exits, everything is stopped and the container exits
      (Render then restarts it); SIGTERM shuts everything down cleanly.
 """
@@ -181,10 +181,19 @@ def main() -> int:
         log("using external database (DATABASE_URL / server.database_url)")
     env["DATABASE_URL"] = db_url
 
+    if cfg.get("separate_worker", True):
+        # Fetching/parsing runs in its own process so the site stays responsive while
+        # thousands of boards are processed. The API needs only a few DB connections.
+        web_env = {**env, "JOBHUNT_ROLE": "api", "DB_POOL_SIZE": "3"}
+        worker_env = {**env, "JOBHUNT_ROLE": "worker"}
+    else:  # one process does both (lowest memory)
+        web_env, worker_env = {**env, "JOBHUNT_ROLE": "all"}, None
     stack.spawn("web", [
         sys.executable, "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", port,
         "--proxy-headers", "--forwarded-allow-ips", "*", "--no-access-log",
-    ], env)
+    ], web_env)
+    if worker_env is not None:
+        stack.spawn("worker", [sys.executable, "-m", "app.worker"], worker_env)
     if cfg.get("discovery_enabled"):
         stack.spawn("discovery", [
             sys.executable, "-m", "app.discover", "--daemon",

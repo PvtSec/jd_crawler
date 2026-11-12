@@ -24,7 +24,10 @@ server:
   postgres_shared_buffers: 64MB   # embedded Postgres only
   postgres_work_mem: 4MB          # embedded Postgres only
   postgres_max_connections: 40
-  db_pool_size: 5                 # app -> database connections
+  db_pool_size: 5                 # fetch worker -> database connections
+  # Run fetching in its own process so pages stay fast while boards are parsed.
+  # Costs ~80 MB more memory; set false on very small instances.
+  separate_worker: true
   # Background discovery of new company boards (heavy: probes ~120k domains a day).
   discovery_enabled: false
   discovery_every_hours: 24
