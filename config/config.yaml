@@ -8,7 +8,7 @@
 server:
   # Public address of the app. Change this when your domain points at Render,
   # e.g. https://jobs.example.com. Used by the keep-alive poller.
-  public_url: "https://jobhunt.onrender.com"
+  public_url: "https://jobhunt.pvtsec.in"
   port: 10000                     # Render sets $PORT, which takes precedence
   # Database and company lists live here. On Render, attach a persistent disk
   # mounted at this path, or the data is rebuilt from scratch on every deploy.
