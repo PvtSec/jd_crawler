@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JobHunt</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M10 4h4a2 2 0 0 1 2 2v1h3a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h3V6a2 2 0 0 1 2-2zm0 2v1h4V6h-4z"/></svg>
+      <span>JobHunt</span>
+    </div>
+    <div class="stats" id="stats"></div>
+    <div class="topbar-actions">
+      <span class="sync" id="sync" title="Fetcher status"><span class="dot"></span><span class="label">…</span></span>
+      <button class="btn ghost" id="btn-status" title="Sources and fetch history">Sources</button>
+      <button class="theme-switch" id="btn-theme" role="switch" aria-checked="false" aria-label="Dark mode" title="Light / dark theme">
+        <span class="knob"></span>
+        <svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2" fill="currentColor"/><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></g></svg>
+        <svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20.5 14.6A8.5 8.5 0 0 1 9.4 3.5a8.5 8.5 0 1 0 11.1 11.1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="banner error hidden" id="config-error"></div>
+
+  <nav class="tabs" id="tabs" role="tablist">
+    <button role="tab" aria-selected="true">All jobs <span class="count" data-count="open_jobs"></span></button>
+    <button class="btn ghost small filters-toggle" id="btn-filters">Filters</button>
+    <span class="newjobs hidden" id="newjobs"></span>
+  </nav>
+
+  <main class="layout">
+    <aside class="filters" id="filters">
+      <div class="field">
+        <label for="f-q">Search</label>
+        <input id="f-q" type="search" placeholder="title, company, keywords…" autocomplete="off">
+      </div>
+
+      <div class="field">
+        <div class="label-row">
+          <label for="f-skill-input">Skills</label>
+          <div class="seg" id="f-skills-mode">
+            <button data-v="all" class="on" title="Job must have all selected skills">all</button>
+            <button data-v="any" title="Job must have at least one">any</button>
+          </div>
+        </div>
+        <div class="chips" id="f-skills"></div>
+        <input id="f-skill-input" list="skill-list" placeholder="add skill…" autocomplete="off">
+        <datalist id="skill-list"></datalist>
+        <div class="top-skills" id="top-skills"></div>
+      </div>
+
+      <div class="field">
+        <label for="f-xskill-input">Exclude skills</label>
+        <div class="chips" id="f-xskills"></div>
+        <input id="f-xskill-input" list="skill-list" placeholder="exclude skill…" autocomplete="off">
+      </div>
+
+      <div class="field">
+        <label>Seniority</label>
+        <div class="checks" id="f-seniority"></div>
+      </div>
+
+      <div class="field">
+        <label for="f-max-years">Max years of experience required</label>
+        <input id="f-max-years" type="number" min="0" max="40" placeholder="any">
+      </div>
+
+      <div class="field">
+        <label for="f-location">Location</label>
+        <input id="f-location" placeholder="e.g. remote, berlin, israel" autocomplete="off">
+        <div class="seg wide" id="f-remote">
+          <button data-v="" class="on">Any</button>
+          <button data-v="true">Remote</button>
+          <button data-v="false" title="On-site or hybrid">On-site</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="f-posted">Posted within</label>
+        <select id="f-posted">
+          <option value="">any time</option>
+          <option value="1">24 hours</option>
+          <option value="3">3 days</option>
+          <option value="7">7 days</option>
+          <option value="14">14 days</option>
+          <option value="30">30 days</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="f-company-input">Company</label>
+        <div class="chips" id="f-companies"></div>
+        <input id="f-company-input" list="company-list" placeholder="add company…" autocomplete="off">
+        <datalist id="company-list"></datalist>
+      </div>
+
+      <div class="field">
+        <label>Source</label>
+        <div class="checks" id="f-sources"></div>
+      </div>
+
+      <div class="field">
+        <label for="f-status">Posting status</label>
+        <select id="f-status">
+          <option value="active">open</option>
+          <option value="closed">closed</option>
+          <option value="any">any</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label>Category</label>
+        <div class="checks" id="f-categories"></div>
+      </div>
+
+      <div class="field toggles">
+        <label><input type="checkbox" id="f-salary"> has salary info</label>
+        <label><input type="checkbox" id="f-techonly"> tech jobs only</label>
+        <label><input type="checkbox" id="f-lang"> hide roles requiring another language</label>
+        <label><input type="checkbox" id="f-flagged"> hide flagged (agencies / harvesters)</label>
+        <label title="Hide aggregator listings whose employer application page hasn't been found yet (applying may require an account on the aggregator)"><input type="checkbox" id="f-indirect"> direct apply links only</label>
+        <label><input type="checkbox" id="f-dups"> include duplicates</label>
+      </div>
+
+      <button class="btn ghost wide" id="btn-reset">Reset filters</button>
+    </aside>
+
+    <section class="results">
+      <div class="toolbar">
+        <div class="result-count" id="result-count"></div>
+      </div>
+      <div class="table-wrap">
+        <table class="jobs" id="jobs">
+          <thead>
+            <tr>
+              <th data-sort="title">Title</th>
+              <th data-sort="company">Company</th>
+              <th data-sort="location">Location</th>
+              <th>Skills</th>
+              <th data-sort="seniority" title="Seniority · years of experience requested">Level</th>
+              <th data-sort="salary">Salary</th>
+              <th data-sort="posted">Posted</th>
+              <th class="actions-col">Link</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="empty hidden" id="empty"></div>
+      </div>
+      <div class="pager" id="pager"></div>
+    </section>
+  </main>
+
+  <div class="drawer hidden" id="drawer" role="dialog" aria-label="Sources">
+    <div class="drawer-head">
+      <h2>Sources</h2>
+      <div>
+        <button class="btn small ghost icon" id="drawer-close" aria-label="Close">✕</button>
+      </div>
+    </div>
+    <div id="drawer-body"></div>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>

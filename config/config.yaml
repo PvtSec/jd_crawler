@@ -1,0 +1,130 @@
+# JobHunt configuration: the single settings file for the container and the keep-alive poller.
+# ---------------------------------------------------------------------------
+# `server` is read once when the container starts (change it, then redeploy).
+# Everything below `fetch` is hot-reloaded: if you mount/edit this file on a
+# running instance, changes apply within seconds. An invalid file is rejected
+# and the previous config stays active (the dashboard shows the error).
+
+server:
+  # Public address of the app. Change this when your domain points at Render,
+  # e.g. https://jobs.example.com. Used by the keep-alive poller.
+  public_url: "https://jobhunt.onrender.com"
+  port: 10000                     # Render sets $PORT, which takes precedence
+  # Database and company lists live here. On Render, attach a persistent disk
+  # mounted at this path, or the data is rebuilt from scratch on every deploy.
+  data_dir: /app/data
+  # Empty = run PostgreSQL inside the container (stored in <data_dir>/pgdata).
+  # To use an external Postgres instead, set the DATABASE_URL environment
+  # variable (keeps the password out of git), in the form
+  # postgresql+asyncpg://user:password@host:5432/dbname
+  database_url: ""
+  log_level: INFO
+  # Memory: ~512 MB instances need the small values below; with 2 GB+ you can
+  # use e.g. shared_buffers 256MB, work_mem 16MB, db_pool_size 10, fetch.max_concurrency 32.
+  postgres_shared_buffers: 64MB   # embedded Postgres only
+  postgres_work_mem: 4MB          # embedded Postgres only
+  postgres_max_connections: 40
+  db_pool_size: 5                 # app -> database connections
+  # Background discovery of new company boards (heavy: probes ~120k domains a day).
+  discovery_enabled: false
+  discovery_every_hours: 24
+
+# Read by keepalive/keepalive.py, which runs OUTSIDE the app (cron, GitHub
+# Actions, another machine) and pings it so Render never puts it to sleep.
+keepalive:
+  url: ""                         # empty = <server.public_url>/api/health
+  interval_minutes: 10            # Render free instances sleep after 15 idle minutes
+  timeout_seconds: 60             # waking a sleeping instance can take ~1 minute
+
+fetch:
+  interval_minutes: 60            # boards with tech jobs + aggregators are polled this often (5..1440)
+  max_concurrency: 16             # total parallel HTTP requests
+  per_host_concurrency: 4         # parallel requests per host (be polite)
+  timeout_seconds: 25
+  retries: 2                      # retries on 429/5xx/timeouts, with backoff
+  user_agent: "JobHunt/1.0 (job listing aggregator)"
+  max_description_chars: 20000
+  warm_interval_hours: 4
+  cool_interval_hours: 12         # boards with only non-tech jobs
+  cold_interval_hours: 48         # boards with no open jobs
+  max_backoff_hours: 168          # failing boards back off exponentially up to this
+  gone_after_failures: 4          # consecutive 404s => board retired (rechecked monthly)
+  non_tech_description_chars: 400 # non-tech jobs keep a short description (saves disk)
+
+validation:
+  interval_minutes: 60            # liveness check cycle for aggregator jobs
+  batch_size: 150
+  recheck_after_hours: 12
+  closed_after_misses: 2          # ATS job missing from N consecutive fetches => closed
+  purge_closed_after_days: 30     # closed jobs are deleted after this
+
+# ---------------------------------------------------------------------------
+# No personal filtering: every job found is stored and listed. Visitors narrow
+# the list with the dashboard filters. Add rules here only to drop jobs entirely.
+match:
+  title_include: []
+  title_exclude: []
+  description_exclude: []
+  companies_exclude: []
+  skills_required: []
+  skills_any: []
+  skills_preferred: {}
+  locations: []
+  remote_only: false
+  skip_region_locked_remote: false
+  seniority: []
+  max_years_experience: null
+  max_age_days: null
+  min_score: 0
+  store_non_matching: true
+  allowed_languages: [english]
+  skip_language_requirements: true   # only labels such jobs; they are still listed
+
+# Postings from recruiters, staffing agencies, job marketplaces and scam-like ads
+# get a "flagged" badge (visitors can hide them with a filter).
+trust:
+  blocked_domains: []
+  blocked_companies: []
+  exclude_middlemen_from_registry: true
+
+skills_extra: {}
+
+# ---------------------------------------------------------------------------
+# Sources. Company boards come from the CSV registries below (relative paths are
+# resolved against server.data_dir; the image seeds them on first start). Boards
+# can also be pinned here (always polled at fetch.interval_minutes) with
+# "token" or "token=Display Name", e.g.  greenhouse: [stripe, wizinc=Wiz]
+sources:
+  company_files:
+    - companies.csv               # baseline (large Workday employers)
+    - companies.discovered.csv    # discovery output (updated if discovery_enabled)
+    - companies.imported.csv      # imported, verified boards
+  auto_register_from_aggregators: true
+
+  greenhouse: []
+  lever: []
+  ashby: []
+  smartrecruiters: []
+  workable: []
+  recruitee: []
+  personio: []
+  breezy: []
+  bamboohr: []
+  teamtailor: []
+  rippling: []
+  pinpoint: []
+  jazzhr: []
+  workday: []
+
+  remotive:
+    enabled: true
+  remoteok:
+    enabled: true
+    queries: []
+  arbeitnow:
+    enabled: true
+    max_pages: 3
+  himalayas:
+    enabled: true
+    queries: []
+    max_pages: 3

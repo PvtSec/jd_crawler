@@ -1,0 +1,26 @@
+# Pings the Render deployment every 10 minutes so it never sleeps. Runs on GitHub's
+# servers, fully independent of the app. The target URL comes from config/config.yaml.
+# (GitHub may delay scheduled runs by a few minutes; it also pauses schedules in
+#  repositories with no activity for 60 days. Re-enable from the Actions tab if so.)
+name: keepalive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            config/config.yaml
+            keepalive/keepalive.py
+          sparse-checkout-cone-mode: false
+      - run: python3 keepalive/keepalive.py --once
